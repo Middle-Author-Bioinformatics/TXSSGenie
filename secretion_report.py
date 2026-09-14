@@ -1705,6 +1705,13 @@ def main(argv=None):
             key_rows.append([sy, k["full"], cat, k["detected"], k["roles"], k["markers"],
                              format(agg.systems_per_type[sy], ","),
                              "%.2f" % (100.0 * genomes_carrying[sy] / n_screened)])
+    # stable column order: grouped by tier, alphabetical inside a tier, so the
+    # layout of this file does not shift between runs or datasets
+    system_cols = []
+    for cat in CATEGORY_ORDER:
+        system_cols.extend(sorted(sy for sy in order if category_of(sy) == cat))
+    system_cols.extend(sorted(sy for sy in order if category_of(sy) not in CATEGORY_ORDER))
+
     genome_rows = []
     for acc in sorted(screened):
         rec = info.get(acc, {})
@@ -1715,7 +1722,13 @@ def main(argv=None):
         taxid = rec.get("taxid", 0)
         if lineage_of is not None and taxid:
             ranks = lineage_of(taxid)
-        row = [acc, n_sys, n_prot]
+        row = [acc, n_sys, n_prot, len(counter) if counter else 0]
+        # one column per functional tier, then one per system type
+        for cat in CATEGORY_ORDER:
+            row.append(sum(n for sy, n in (counter or {}).items()
+                           if category_of(sy) == cat))
+        for sy in system_cols:
+            row.append((counter or {}).get(sy, 0))
         for r in RANKS:
             value = ranks.get(r, "")
             if not value:
@@ -1728,8 +1741,11 @@ def main(argv=None):
         row.append(taxid or "NA")
         row.append(rec.get("organism", "NA"))
         genome_rows.append(row)
+    tier_cols = ["n_" + c.split(",")[0].split(" and ")[0].strip().lower().replace(" ", "_")
+                 for c in CATEGORY_ORDER]
     write_tsv(os.path.join(tables_dir, "per_genome_summary.tsv"),
-              ["accession", "n_systems", "n_proteins"] + RANKS + ["taxid", "organism_name"],
+              ["accession", "n_systems", "n_proteins", "n_system_types"] + tier_cols +
+              system_cols + RANKS + ["taxid", "organism_name"],
               genome_rows)
     sys.stderr.write("  per-genome table: %s rows in %s\n"
                      % (human(len(genome_rows)),
