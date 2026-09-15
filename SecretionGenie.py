@@ -45,7 +45,15 @@ Two CSV outputs are produced, in the same style as ATPGenie:
 
   * <out>/secretiongenie-summary.csv   : one block of rows per detected system
                                          (gene-level detail), blocks separated
-                                         by a '####' line
+                                         by a '####' line. Every row carries the
+                                         gene's strand, nucleotide start and end,
+                                         gene length in nt and protein length in
+                                         aa, taken from the Prodigal FASTA headers
+                                         or, with --gbk, from the CDS features of
+                                         the GenBank file. Where the protein file
+                                         has no coordinates, the four positional
+                                         fields are NA and protein length is still
+                                         reported.
   * <out>/secretiongenie.heatmap.csv   : heatmap-compatible matrix, rows are
                                          system types (and, optionally with
                                          --genes, individual components),
@@ -123,6 +131,96 @@ def fasta(fasta_file):
             seq += i
     Dict[header] = seq
     return Dict
+
+
+def prodigal_coords(faa_path):
+    """ORF -> (start, end, strand) read from Prodigal-style FASTA headers.
+
+    Prodigal writes '>orf_1 # 190 # 255 # 1 # ID=1_1;partial=00;...', so the
+    nucleotide coordinates and the strand of every called gene are already in
+    the protein file. Headers without those fields (a plain '>orf_1', as written
+    by most GenBank-to-FASTA converters) simply yield no entry, and the caller
+    reports NA for that ORF rather than guessing.
+    """
+    coords = {}
+    try:
+        handle = open(faa_path)
+    except (IOError, OSError):
+        return coords
+    with handle:
+        for line in handle:
+            if not line.startswith(">"):
+                continue
+            fields = [f.strip() for f in line[1:].rstrip("\n").split(" # ")]
+            if len(fields) < 4:
+                continue
+            orf = fields[0].split(" ")[0]
+            try:
+                start = int(fields[1])
+                end = int(fields[2])
+                strand = int(fields[3])
+            except ValueError:
+                continue
+            coords[orf] = (min(start, end), max(start, end), "-" if strand < 0 else "+")
+    return coords
+
+
+def genbank_cds_coords(gbk_path):
+    """locus_tag (and protein_id) -> (start, end, strand) for every CDS feature.
+
+    Locations are read from the feature table, so complement() gives the strand
+    and join()/order() collapse to the outermost bounds of the coding region.
+    Partial markers ('<1..>500') are tolerated.
+    """
+    coords = {}
+    in_cds = False
+    location = ""
+    current = None
+    try:
+        handle = open(gbk_path, errors="replace")
+    except (IOError, OSError):
+        return coords
+
+    def finish(loc):
+        numbers = re.findall(r"\d+", loc)
+        if len(numbers) < 2:
+            return None
+        values = [int(n) for n in numbers]
+        return (min(values), max(values), "-" if "complement" in loc else "+")
+
+    with handle:
+        for line in handle:
+            raw = line.rstrip("\n")
+            feature = re.match(r"^ {5}(\S+)\s+(.*)$", raw)
+            if feature:
+                in_cds = feature.group(1) == "CDS"
+                location = feature.group(2).strip() if in_cds else ""
+                current = None
+                continue
+            if not in_cds:
+                continue
+            stripped = raw.strip()
+            if stripped.startswith("/"):
+                if current is None:
+                    current = finish(location)
+                tag = re.match(r'^/(locus_tag|protein_id|old_locus_tag)="([^"]+)"', stripped)
+                if tag and current:
+                    coords.setdefault(tag.group(2), current)
+            elif stripped and current is None:
+                # continuation of a multi-line location
+                location += stripped
+    return coords
+
+
+def coord_fields(coords, orf, seq):
+    """the five extra output columns: strand, start, end, gene length, protein length"""
+    protein = str(seq).replace("*", "") if seq and seq != "EMPTY" else ""
+    prot_len = str(len(protein)) if protein else "NA"
+    entry = coords.get(orf) if coords else None
+    if entry:
+        start, end, strand = entry
+        return [strand, str(start), str(end), str(end - start + 1), prot_len]
+    return ["NA", "NA", "NA", "NA", prot_len]
 
 
 def filt(list, items):
@@ -1345,6 +1443,7 @@ def main():
     # -----------------------------------------------------------------
 
     BinDict = defaultdict(lambda: defaultdict(lambda: 'EMPTY'))
+    coordsByGenome = {}     # genome -> {ORF: (start, end, strand)}
     genomes = []
     for i in sorted(binDirLS):
         if lastItem(i.split(".")) != args.bin_ext:
@@ -1391,6 +1490,12 @@ def main():
             os.system('gtt-genbank-to-AA-seqs -i %s/%s -o %s/%s.faa' % (binDir, i, outDirectory, i))
             faa = fasta(open("%s/%s.faa" % (outDirectory, i)))
 
+            # nucleotide coordinates and strand come from the CDS features of the
+            # source GenBank file, keyed by locus_tag / protein_id
+            gbkCoords = genbank_cds_coords("%s/%s" % (binDir, i))
+            altCoords = {}
+            renamedCoords = {}
+
             gbkDict = defaultdict(list)
             counter = 0
             count = 0
@@ -1400,6 +1505,7 @@ def main():
 
             if count > 0:
                 locus = "unknown"
+                seenTags = defaultdict(set)
                 for gbkline in open("%s/%s" % (binDir, i)):
                     ls = gbkline.rstrip()
                     if re.findall(r'LOCUS', ls):
@@ -1408,10 +1514,17 @@ def main():
                         locusTag = remove(ls.split("=")[1], ["\""])
                         counter += 1
                     if counter > 0:
-                        gbkDict[locus].append(locusTag)
+                        # a locus_tag appears on both the 'gene' and the 'CDS'
+                        # feature of the same gene, so keep only its first
+                        # occurrence: duplicated ORFs would double every rank and
+                        # halve the apparent distance between neighbouring genes
+                        if locusTag not in seenTags[locus]:
+                            seenTags[locus].add(locusTag)
+                            gbkDict[locus].append(locusTag)
                         counter = 0
             else:
                 locus = "unknown"
+                seenAlt = defaultdict(set)
                 for gbkline in open("%s/%s" % (binDir, i)):
                     ls = gbkline.rstrip()
                     if re.findall(r'LOCUS', ls):
@@ -1423,9 +1536,17 @@ def main():
                         end = remove(gene.split("..")[1], ["c", "o", "m", "p", "l", "e", "m",
                                                            "e", "n", "t", "(", ")"])
                         altContigName = (locus + "_" + start + "_" + end)
+                        try:
+                            altCoords[altContigName] = (
+                                min(int(start), int(end)), max(int(start), int(end)),
+                                "-" if re.findall(r'complement', ls) else "+")
+                        except ValueError:
+                            pass
                         counter += 1
                     if counter > 0:
-                        gbkDict[locus].append(altContigName)
+                        if altContigName not in seenAlt[locus]:
+                            seenAlt[locus].add(altContigName)
+                            gbkDict[locus].append(altContigName)
                         counter = 0
 
             idxOut = open("%s/ORF_calls/%s-proteins.idx" % (outDirectory, i), "w")
@@ -1437,6 +1558,9 @@ def main():
                     if len(faa[gbkey2]) > 0 and faa[gbkey2] != "EMPTY":
                         newOrf = gbkkey1 + "_" + str(counter)
                         idxOut.write(gbkey2 + "," + newOrf + "\n")
+                        entry = gbkCoords.get(gbkey2) or altCoords.get(gbkey2)
+                        if entry:
+                            renamedCoords[newOrf] = entry
                         faaOut.write(">" + newOrf + "\n")
                         faaOut.write(str(faa[gbkey2]) + "\n")
             idxOut.close()
@@ -1446,6 +1570,18 @@ def main():
         for key in proteins.keys():
             if key:
                 BinDict[cell][key.split(" # ")[0]] = proteins[key]
+
+        if args.gbk:
+            coordsByGenome[cell] = renamedCoords
+        else:
+            # Prodigal keeps start / end / strand in the protein FASTA headers,
+            # whether it was just run here or the ORF calls were supplied
+            coordsByGenome[cell] = prodigal_coords(
+                "%s/ORF_calls/%s-proteins.faa" % (outDirectory, i))
+        located = len(coordsByGenome[cell])
+        if not located:
+            print("  note: no gene coordinates found for %s - strand, start, end and "
+                  "gene_length_nt will be NA in the output" % i)
 
     if not genomes:
         print("No file with the extension '%s' was found in %s" % (args.bin_ext, args.bin_dir))
@@ -1550,12 +1686,16 @@ def main():
 
     # a table of all retained hits, for reference
     allHitsOut = open("%s/secretiongenie-all_hits.csv" % outDirectory, "w")
-    allHitsOut.write("file,ORF,replicon,position,gene,i_evalue,bit_score,"
+    allHitsOut.write("file,ORF,replicon,position,strand,gene_start,gene_end,gene_length_nt,"
+                     "protein_length_aa,gene,i_evalue,bit_score,"
                      "profile_coverage,sequence_coverage,begin,end\n")
     for genome in genomes:
         for hit in sorted(hitsByGenome[genome], key=lambda h: (h.replicon, h.position)):
             allHitsOut.write(",".join([csvSafe(genome), csvSafe(hit.orf), csvSafe(hit.replicon),
-                                       str(hit.position), csvSafe(hit.gene_name),
+                                       str(hit.position)] +
+                                      coord_fields(coordsByGenome.get(genome), hit.orf,
+                                                   BinDict[genome][hit.orf]) +
+                                      [csvSafe(hit.gene_name),
                                        str(hit.i_eval), str(hit.score),
                                        "%.3f" % hit.cov_profile, "%.3f" % hit.cov_seq,
                                        str(hit.begin), str(hit.end)]) + "\n")
@@ -1675,7 +1815,8 @@ def main():
 
     summaryPath = "%s/secretiongenie-summary.csv" % outDirectory
     out = open(summaryPath, "w")
-    out.write("file,ORF,gene,function,gene_status,system,system_id,replicon,position,locus,"
+    out.write("file,ORF,gene,function,gene_status,system,system_id,replicon,position,"
+              "strand,gene_start,gene_end,gene_length_nt,protein_length_aa,locus,"
               "hit_type,evalue,bit_score,profile_coverage,sequence_coverage,system_score,"
               "system_wholeness,nb_loci,seq\n")
     for genome in genomes:
@@ -1698,8 +1839,9 @@ def main():
                 out.write(",".join([csvSafe(genome), csvSafe(hit.orf), csvSafe(hit.gene.name),
                                     csvSafe(hit.function()), csvSafe(hit.status),
                                     csvSafe(system.model.name), csvSafe(system.id),
-                                    csvSafe(hit.core.replicon), str(hit.position),
-                                    "-" if args.unordered else locusOf.get(hit, "-"),
+                                    csvSafe(hit.core.replicon), str(hit.position)] +
+                                   coord_fields(coordsByGenome.get(genome), hit.orf, seq) +
+                                   ["-" if args.unordered else locusOf.get(hit, "-"),
                                     "unordered" if args.unordered else hit.hit_type(),
                                     str(hit.core.i_eval), str(hit.score),
                                     "%.3f" % hit.core.cov_profile,

@@ -1707,10 +1707,13 @@ def main(argv=None):
                              "%.2f" % (100.0 * genomes_carrying[sy] / n_screened)])
     # stable column order: grouped by tier, alphabetical inside a tier, so the
     # layout of this file does not shift between runs or datasets
+    # every model in the key gets a column, whether or not it was found in this
+    # screen, so the table has the same shape for any subset of genomes
+    known = set(FUNCTIONAL_CATEGORY) | set(order)
     system_cols = []
     for cat in CATEGORY_ORDER:
-        system_cols.extend(sorted(sy for sy in order if category_of(sy) == cat))
-    system_cols.extend(sorted(sy for sy in order if category_of(sy) not in CATEGORY_ORDER))
+        system_cols.extend(sorted(sy for sy in known if category_of(sy) == cat))
+    system_cols.extend(sorted(sy for sy in known if category_of(sy) not in CATEGORY_ORDER))
 
     genome_rows = []
     for acc in sorted(screened):
